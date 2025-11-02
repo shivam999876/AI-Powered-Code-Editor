@@ -2,6 +2,7 @@ import streamlit as st
 import subprocess
 import os
 import tempfile
+import shutil
 from dotenv import load_dotenv
 import sys
 import re
@@ -11,7 +12,6 @@ try:
     from langchain_google_genai import ChatGoogleGenerativeAI as GeminiAI
     from langchain.agents import initialize_agent, AgentType
     from langchain.memory import ConversationBufferMemory
-    from langchain.tools import Tool
     from langchain_community.tools.tavily_search import TavilySearchResults
     from langchain_core.tools import tool
 except Exception as e:
@@ -63,31 +63,47 @@ def create_file(file_name: str, content: str = ""):
 def add_code_to_file(file_name: str, code: str):
     """Add code to the given file."""
     try:
+        # Check if file exists and has content
+        needs_newline = os.path.exists(file_name) and os.path.getsize(file_name) > 0
         with open(file_name, "a", encoding="utf-8") as f:
-            if f.tell() > 0:
+            if needs_newline:
                 f.write("\n")
             f.write(code)
         return f"✅ Code added to '{file_name}' successfully."
     except Exception as e:
         return f"❌ Error: {str(e)}"
 
-# ✅ Tavily Search Tool
-tavily_search = TavilySearchResults(api_key=TAVILY_API_KEY)
-
-tools = [
-    Tool(name="Create Folder", func=create_folder, description="Creates a new folder with a given name."),
-    Tool(name="Create File", func=create_file, description="Creates a new file with a given name and optional content."),
-    Tool(name="Add Code to File", func=add_code_to_file, description="Adds provided code to an existing file."),
-    Tool(name="Web Search", func=tavily_search.run, description="Performs an online search and returns top results.")
-]
-
-# ✅ Initialize AI Agent
-memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-llm = GeminiAI(model="gemini-pro", google_api_key=GEMINI_API_KEY)
-agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, memory=memory, verbose=True)
-
 # ✅ Streamlit UI
 st.set_page_config(page_title="AI-Powered Code Editor", page_icon="💡", layout="wide")
+
+# ✅ Initialize tools and agent (using session state to avoid recreating on each rerun)
+if "agent_initialized" not in st.session_state:
+    try:
+        # ✅ Tavily Search Tool
+        tavily_search = TavilySearchResults(api_key=TAVILY_API_KEY)
+        
+        # ✅ Tools list - @tool decorator already creates Tool objects, use them directly
+        tools = [
+            create_folder,
+            create_file,
+            add_code_to_file,
+            tavily_search
+        ]
+        
+        # ✅ Initialize AI Agent
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        llm = GeminiAI(model="gemini-pro", google_api_key=GEMINI_API_KEY)
+        st.session_state.agent = initialize_agent(
+            tools, llm, 
+            agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, 
+            memory=memory, 
+            verbose=False
+        )
+        st.session_state.agent_initialized = True
+    except Exception as e:
+        st.error(f"Failed to initialize AI agent: {str(e)}")
+        st.session_state.agent = None
+        st.session_state.agent_initialized = True
 st.title("💡 AI-Powered Code Editor")
 st.write("Write, execute, and manage your code with AI assistance!")
 
@@ -101,20 +117,25 @@ if st.button("🚀 Run Code"):
         st.error("Please enter some code to run!")
     else:
         with st.spinner("Running your code..."):
+            temp_file_path = None
+            temp_dir = None
+            exe_path = None
             try:
                 if language == "Python":
                     suffix = ".py"
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="w", encoding="utf-8") as temp_file:
                         temp_file.write(code)
                         temp_file.flush()
-                        result = subprocess.run(["python", temp_file.name], capture_output=True, text=True)
+                        temp_file_path = temp_file.name
+                    result = subprocess.run(["python", temp_file_path], capture_output=True, text=True)
 
                 elif language == "JavaScript":
                     suffix = ".js"
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="w", encoding="utf-8") as temp_file:
                         temp_file.write(code)
                         temp_file.flush()
-                        result = subprocess.run(["node", temp_file.name], capture_output=True, text=True)
+                        temp_file_path = temp_file.name
+                    result = subprocess.run(["node", temp_file_path], capture_output=True, text=True)
 
                 elif language == "Java":
                     # Extract public class name
@@ -142,14 +163,16 @@ if st.button("🚀 Run Code"):
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, mode="w", encoding="utf-8") as temp_file:
                         temp_file.write(code)
                         temp_file.flush()
-                        exe_path = temp_file.name + ".out"
-                        compile_result = subprocess.run(["g++", temp_file.name, "-o", exe_path], capture_output=True, text=True)
-                        if compile_result.stderr:
-                            st.subheader("⚠️ Compilation Errors:")
-                            st.code(compile_result.stderr.strip(), language="bash")
-                            result = None
-                        else:
-                            result = subprocess.run([exe_path], capture_output=True, text=True)
+                        temp_file_path = temp_file.name
+                    # Create executable with proper name
+                    exe_path = temp_file_path.rsplit('.', 1)[0] + ".exe" if os.name == 'nt' else temp_file_path.rsplit('.', 1)[0]
+                    compile_result = subprocess.run(["g++", temp_file_path, "-o", exe_path], capture_output=True, text=True)
+                    if compile_result.stderr:
+                        st.subheader("⚠️ Compilation Errors:")
+                        st.code(compile_result.stderr.strip(), language="bash")
+                        result = None
+                    else:
+                        result = subprocess.run([exe_path], capture_output=True, text=True)
 
                 else:
                     st.error("Unsupported language!")
@@ -166,3 +189,20 @@ if st.button("🚀 Run Code"):
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
+            finally:
+                # Clean up temporary files
+                if temp_file_path and os.path.exists(temp_file_path):
+                    try:
+                        os.unlink(temp_file_path)
+                    except Exception:
+                        pass
+                if exe_path and os.path.exists(exe_path):
+                    try:
+                        os.unlink(exe_path)
+                    except Exception:
+                        pass
+                if temp_dir and os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except Exception:
+                        pass
